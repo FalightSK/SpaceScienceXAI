@@ -5,7 +5,7 @@ import seaborn as sns
 def plot_attention_heatmap(single_batch_attention, feature_names, figsize=(10, 8)):
     plt.figure(figsize=figsize)  # Adjust figure size for better readability
     sns.heatmap(single_batch_attention,
-                annot=True,  # Show the values in the cells
+                annot=False,  # Show the values in the cells
                 cmap="viridis",  # Choose a colormap
                 xticklabels=feature_names,  # Use the feature names
                 yticklabels=feature_names,  # Use the feature names

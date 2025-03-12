@@ -100,6 +100,73 @@ class SpecialTransformer(nn.Module):
             x = layer.norm2(x + layer.dropout2(layer.linear2(layer.dropout(layer.activation(layer.linear1(x))))))
         return attention_weights
 
+class EmbedingSpecialTransformer(nn.Module):
+    def __init__(self, config_path: str):
+        super().__init__()
+
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+
+        self.feature_dim = config['feature_dim']
+        self.context_dim = config['context_dim']
+        embedding_dim = config['embedding_dim']
+        num_heads = config['num_heads']
+        num_layers = config['num_layers']
+        ffn_dim = config['ffn_dim']
+        dropout = config['dropout']
+        output_dim = config['output_dim']
+
+        self.feature_embedding = nn.Linear(self.feature_dim, embedding_dim)
+        # No separate context embedding here, as it's already encoded
+
+        # Transformer Encoder for features
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim,
+            nhead=num_heads,
+            dim_feedforward=ffn_dim,
+            dropout=dropout,
+            batch_first=True  # Important: Input is (batch, seq, features)
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # RMSnorm
+        self.rmsNorm = nn.LayerNorm(embedding_dim)
+
+        # Output layer
+        self.output_layer = nn.Linear(embedding_dim, output_dim)
+
+        self.num_heads = num_heads  # Store for attention analysis
+
+    def forward(self, features: torch.Tensor, context_embedding: torch.Tensor) -> torch.Tensor:
+        # 1. Embed features
+        embedded_features = self.feature_embedding(features)  # (batch_size, num_features, embedding_dim)
+
+        # 2. Transformer Encoder (on features only)
+        integrated_representation = torch.cat([embedded_features, context_embedding], dim=1)
+        encoded_features = self.transformer_encoder(integrated_representation)  # (batch_size, num_features, embedding_dim)
+        
+        # 3. Aggregate feature representations (e.g., mean pooling)
+        aggregated_features = torch.mean(encoded_features, dim=1)  # (batch_size, embedding_dim)
+        norm_agg_features = self.rmsNorm(aggregated_features)
+
+        # 4. Output layer
+        output = self.output_layer(norm_agg_features)  # (batch_size, output_dim)
+
+        return output
+
+    def get_attention_weights(self, features: torch.Tensor, context_embedding: torch.Tensor) -> List[torch.Tensor]:
+        embedded_features = self.feature_embedding(features)
+        attention_weights = []
+        
+        # Manually iterate through the encoder layers
+        x = torch.cat([embedded_features, context_embedding], dim=1)
+        for layer in self.transformer_encoder.layers:
+            x, attn_weights = layer.self_attn(x, x, x, need_weights=True)
+            attention_weights.append(attn_weights)
+            x = layer.dropout1(x)
+            x = layer.norm1(x + layer.dropout1(x))
+            x = layer.norm2(x + layer.dropout2(layer.linear2(layer.dropout(layer.activation(layer.linear1(x))))))
+        return attention_weights
 
 # --- Example Usage ---
 if __name__ == '__main__':

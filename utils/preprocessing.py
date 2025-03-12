@@ -1,7 +1,8 @@
 import torch
 import pandas as pd
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from torch.utils.data import Dataset, DataLoader
+from sklearn.ensemble import IsolationForest
+from torch.utils.data import Dataset, DataLoader, Subset
 from typing import List, Dict, Optional, Tuple
 import numpy as np  # Import numpy explicitly
 
@@ -17,7 +18,10 @@ class TabularDataset(Dataset):
                  numerical_features_info: Dict[str, str] = None,
                  categorical_features: List[str] = None,
                  sep: str = ",",
-                 header: str = "infer"
+                 header: str = "infer",
+                 outlier_removal: bool = False,
+                 outlier_method: str = 'clamp',
+                 outlier_std_threshold: float = 2.0
                  ):
         super().__init__()
 
@@ -31,16 +35,23 @@ class TabularDataset(Dataset):
         self.categorical_features = categorical_features if categorical_features is not None else []
         self.sep = sep
         self.header = header
+        self.outlier_removal = outlier_removal
+        self.outlier_method = outlier_method
+        self.outlier_std_threshold = outlier_std_threshold
+
 
         # Load and preprocess data
         self.load_and_preprocess_data()
+        self.shift_target()  # Shift the target variable
+        self.add_previous_target()  # Add previous target as a feature
+
 
     def load_and_preprocess_data(self):
-        """Loads and preprocesses the data in a single, unified method."""
+        """Loads and preprocesses the data."""
         self.load_data()
         self.validate_columns()
         self.preprocess_data()
-        self.ensure_numerical_types() # Added: Ensure all features are numeric
+        self.ensure_numerical_types()
 
     def load_data(self):
         """Loads data from the specified file."""
@@ -50,7 +61,7 @@ class TabularDataset(Dataset):
             self.data = pd.read_parquet(self.data_path)
         else:
             raise ValueError(f"Unsupported file type: {self.file_type}")
-        
+
     def validate_columns(self):
         """Validates that specified columns exist in the data."""
         all_cols = self.feature_cols + [self.target_col] + self.context_cols
@@ -73,25 +84,26 @@ class TabularDataset(Dataset):
 
         # 2. Scale Numerical Features
         for col, method in self.numerical_features_info.items():
-            if col in self.data.columns:  # Check if the column still exists
+            if col in self.data.columns:
                 if method == 'standard':
                     scaler = StandardScaler()
                 elif method == 'minmax':
                     scaler = MinMaxScaler()
                 else:
                     raise ValueError(f"Invalid scaling method: {method}")
-                # Reshape, fit_transform, and ensure float32
                 self.data[col] = scaler.fit_transform(self.data[[col]])
-                
-        # 3. scale Target
+
+        # 3. scale Target (before shifting and adding previous target)
         if self.norm_target:
-            self.data[self.target_col] = StandardScaler().fit_transform(self.data[[self.target_col]])
+            self.scaler_target = StandardScaler() # Store the scaler
+            self.data[self.target_col] = self.scaler_target.fit_transform(self.data[[self.target_col]])
+
 
         # 4. One-Hot Encode Categorical Features
         if self.categorical_features:
             self.data = pd.get_dummies(self.data, columns=self.categorical_features, prefix=self.categorical_features, dummy_na=False)
 
-            # Correctly update feature_cols (as before)
+            # Correctly update feature_cols
             new_feature_cols = []
             for col in self.feature_cols:
                 if col not in self.categorical_features:
@@ -104,9 +116,7 @@ class TabularDataset(Dataset):
     def ensure_numerical_types(self):
         """Ensures all feature and target columns are numeric (float32)."""
 
-        # Convert feature columns to float32
-        for col in self.feature_cols:
-            # Explicitly attempt numeric conversion, handle errors
+        for col in self.feature_cols + [self.target_col]:
             try:
                 self.data[col] = pd.to_numeric(self.data[col], errors='raise').astype(np.float32)
             except ValueError as e:
@@ -114,23 +124,21 @@ class TabularDataset(Dataset):
                 print(f"Unique values in '{col}':", self.data[col].unique())
                 raise
 
-        # Convert target column to float32
-        try:
-            self.data[self.target_col] = pd.to_numeric(self.data[self.target_col], errors='raise').astype(np.float32)
-        except ValueError as e:
-            print(f"Error converting target column '{self.target_col}' to numeric: {e}")
-            print(f"Unique values in '{self.target_col}':", self.data[self.target_col].unique())
-            raise
+    def shift_target(self):
+        """Shifts the target variable by one step ahead."""
+        self.data[self.target_col] = self.data[self.target_col].shift(-1)
+        self.data.dropna(subset=[self.target_col], inplace=True) # Drop the last row (NaN target)
 
+    def add_previous_target(self):
+        """Adds the previous target value as a feature."""
+        self.data['prev_target'] = self.data[self.target_col].shift(1).fillna(method='bfill')
+        self.feature_cols.append('prev_target')
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
-
-        # No changes needed here, BUT the CRITICAL part is that
-        # self.data is guaranteed to have the correct types by now.
         features = torch.tensor(row[self.feature_cols].values, dtype=torch.float32)
         target = torch.tensor(row[self.target_col], dtype=torch.float32)
 
@@ -144,262 +152,97 @@ class TabularDataset(Dataset):
 
         return {'features': features, 'target': target, 'context': context}
 
-class TabularDataset_lag(Dataset):
-
-    def __init__(self,
-                 data_path: str,
-                 feature_cols: List[str],
-                 target_col: str,
-                 norm_target: bool = True,
-                 context_cols: Optional[List[str]] = None,
-                 file_type: str = 'csv',
-                 numerical_features_info: Dict[str, str] = None,
-                 categorical_features: List[str] = None,
-                 sep: str = ",",
-                 header: str = "infer",
-                 seq_len: int = 1  # Default to 1 for single-step prediction
-                 ):
-        super().__init__()
-
-        self.data_path = data_path
-        self.feature_cols = feature_cols
-        self.target_col = target_col
-        self.norm_target = norm_target
-        self.context_cols = context_cols if context_cols is not None else []
-        self.file_type = file_type.lower()
-        self.numerical_features_info = numerical_features_info if numerical_features_info is not None else {}
-        self.categorical_features = categorical_features if categorical_features is not None else []
-        self.sep = sep
-        self.header = header
-        self.seq_len = seq_len
-
-        # Load and preprocess data
-        self.load_and_preprocess_data()
-        if self.seq_len > 1:  # Only create lags if seq_len > 1
-            self.create_time_lags()
 
 
-    def load_and_preprocess_data(self):
-        """Loads and preprocesses the data."""
-        self.load_data()
-        self.validate_columns()
-        self.preprocess_data()
-        self.ensure_numerical_types()
+def clamp_outliers(data: pd.DataFrame, feature_cols: List[str], std_threshold: float) -> pd.DataFrame:
+    """Clamps outliers to a specified standard deviation threshold."""
+    data_clamped = data.copy()
+    for col in feature_cols:
+        if pd.api.types.is_numeric_dtype(data_clamped[col]):  # Only clamp numeric columns
+            mean = data_clamped[col].mean()
+            std = data_clamped[col].std()
+            lower_bound = mean - std_threshold * std
+            upper_bound = mean + std_threshold * std
+            data_clamped[col] = np.clip(data_clamped[col], lower_bound, upper_bound)
+    return data_clamped
 
 
-    def load_data(self):
-        """Loads data from the specified file."""
-        if self.file_type == 'csv':
-            self.data = pd.read_csv(self.data_path, sep=self.sep, header=self.header)
-        elif self.file_type == 'parquet':
-            self.data = pd.read_parquet(self.data_path)
-        else:
-            raise ValueError(f"Unsupported file type: {self.file_type}")
-        
+def split_data(dataset: TabularDataset, train_ratio: float = 0.8, val_ratio: float = 0.1, test_ratio: float = 0.1, random_seed: int = 42) -> Tuple[Dataset, Dataset, Dataset]:
+    """
+    Splits data into train, validation, and test sets.  Train/Val are shuffled,
+    Test is sequential.  Returns Datasets.
+    """
+    dataset_size = len(dataset)
+    test_size = int(test_ratio * dataset_size)
+    train_val_size = dataset_size - test_size
+    train_size = int(train_ratio / (train_ratio + val_ratio) * train_val_size)
+    val_size = train_val_size - train_size
 
-    def validate_columns(self):
-        """Validates that specified columns exist in the data."""
-        all_cols = self.feature_cols + [self.target_col] + self.context_cols
-        if not all(col in self.data.columns for col in all_cols):
-            missing_cols = [col for col in all_cols if col not in self.data.columns]
-            raise ValueError(f"Columns not found in data: {missing_cols}")
+    # --- Create Indices ---
+    train_val_indices = list(range(train_val_size))
+    test_indices = list(range(train_val_size, dataset_size))
 
+    # --- Shuffle Train/Val Indices ---
+    rng = np.random.default_rng(random_seed)
+    rng.shuffle(train_val_indices)
 
-    def preprocess_data(self):
-        """Preprocesses the data (handling missing values, scaling, encoding)."""
+    train_indices = train_val_indices[:train_size]
+    val_indices = train_val_indices[train_size:]
 
-        # 1. Handle Missing Values (Imputation)
-        for col in self.data.columns:
-            if self.data[col].isnull().any():
-                if col in self.numerical_features_info:
-                    # Numerical: Impute with median
-                    self.data[col] = self.data[col].fillna(self.data[col].median())
-                elif col in self.categorical_features + [self.target_col] + self.context_cols:
-                    # Categorical: Impute with mode
-                    self.data[col] = self.data[col].fillna(self.data[col].mode()[0])
+    # --- Create Subsets ---
+    # Create Subsets *before* outlier removal
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(dataset, val_indices)
+    test_dataset = Subset(dataset, test_indices)
 
-        # 2. Scale Numerical Features
-        for col, method in self.numerical_features_info.items():
-            if col in self.data.columns:  # Check if the column still exists
-                if method == 'standard':
-                    scaler = StandardScaler()
-                elif method == 'minmax':
-                    scaler = MinMaxScaler()
-                else:
-                    raise ValueError(f"Invalid scaling method: {method}")
-                # Reshape, fit_transform, and ensure float32
-                self.data[col] = scaler.fit_transform(self.data[[col]])
-                
+    # --- Outlier Removal (Train/Val ONLY) ---
+    if dataset.outlier_removal:
+        # Convert Subsets back to DataFrames (efficiently)
+        train_df = dataset.data.iloc[train_indices].copy()
+        val_df = dataset.data.iloc[val_indices].copy()
 
-        # 3. scale Target
-        if self.norm_target:
-            self.data[self.target_col] = StandardScaler().fit_transform(self.data[[self.target_col]])
+        # Apply clamping
+        train_df_clamped = clamp_outliers(train_df, dataset.feature_cols + [dataset.target_col], dataset.outlier_std_threshold)
+        val_df_clamped = clamp_outliers(val_df, dataset.feature_cols + [dataset.target_col], dataset.outlier_std_threshold)
 
-        # 4. One-Hot Encode Categorical Features
-        if self.categorical_features:
-            self.data = pd.get_dummies(self.data, columns=self.categorical_features, prefix=self.categorical_features, dummy_na=False)
+        # Create new *Datasets* from the clamped DataFrames.  This is now MUCH cleaner.
+        train_dataset = CustomDataFrameDataset(train_df_clamped, dataset)
+        val_dataset = CustomDataFrameDataset(val_df_clamped, dataset)
+        # test_dataset remains unchanged, as we don't remove outliers from it.
 
-            # Correctly update feature_cols (IMPORTANT!)
-            new_feature_cols = []
-            for col in self.feature_cols:
-                if col not in self.categorical_features:
-                    new_feature_cols.append(col)
-            for col in self.data.columns:
-                if any(cat_col in col for cat_col in self.categorical_features):
-                    new_feature_cols.append(col)
-            self.feature_cols = new_feature_cols
+    return train_dataset, val_dataset, test_dataset  # Return Subsets
 
 
-    def ensure_numerical_types(self):
-        """Ensures all feature and target columns are numeric (float32)."""
-
-        for col in self.feature_cols + [self.target_col]:
-            try:
-                self.data[col] = pd.to_numeric(self.data[col], errors='raise').astype(np.float32)
-            except ValueError as e:
-                print(f"Error converting column '{col}' to numeric: {e}")
-                print(f"Unique values in '{col}':", self.data[col].unique())
-                raise
-
-
-    def create_time_lags(self):
-        """Creates time-lagged features (excluding the target variable)."""
-
-        original_feature_cols = self.feature_cols.copy()
-        lagged_data = self.data[original_feature_cols].copy()  # Work on a copy
-
-        for col in original_feature_cols:
-            for lag in range(1, self.seq_len + 1):
-                new_col_name = f'{col}_lag_{lag}'
-                lagged_data[new_col_name] = self.data[col].shift(lag).fillna(method='bfill')
-                self.feature_cols.append(new_col_name)  # Add to feature_cols
-
-        # Add target and context columns back to lagged_data
-        lagged_data[self.target_col] = self.data[self.target_col]
-        for col in self.context_cols:
-            lagged_data[col] = self.data[col]
-
-        # Drop original feature columns (keep target and context)
-        lagged_data = lagged_data.drop(columns=original_feature_cols)
-        self.data = lagged_data
-
+class CustomDataFrameDataset(Dataset):
+    """
+    A custom Dataset that wraps a DataFrame but inherits metadata from the original TabularDataset.
+    This keeps all the preprocessing and feature information consistent.
+    """
+    def __init__(self, dataframe: pd.DataFrame, original_dataset: TabularDataset):
+        self.data = dataframe
+        self.feature_cols = original_dataset.feature_cols
+        self.target_col = original_dataset.target_col
+        self.context_cols = original_dataset.context_cols
+        # You might need to store other attributes from original_dataset if needed
 
     def __len__(self):
-        # Adjust length if using lags
-        if self.seq_len > 1:
-            return len(self.data) - self.seq_len + 1  # Correct length calculation
         return len(self.data)
 
-
     def __getitem__(self, idx):
-        if self.seq_len > 1:
-            # Time-lagged case
-            end_idx = idx + self.seq_len
-            features = torch.tensor(self.data[self.feature_cols].iloc[idx:end_idx].values, dtype=torch.float32)
-            target = torch.tensor(self.data[self.target_col].iloc[end_idx-1], dtype=torch.float32)  # Target from the *last* step
-            #Correct the context.
-            context = {}
-            if self.context_cols:
-                for col in self.context_cols:
-                    if pd.api.types.is_numeric_dtype(self.data[col]):
-                        context[col] = torch.tensor(self.data[col].iloc[end_idx-1], dtype=torch.float32)
-                    else:
-                        context[col] = str(self.data[col].iloc[end_idx-1])
-        else:
-            # Single-step case (no lags)
-            row = self.data.iloc[idx]
-            features = torch.tensor(row[self.feature_cols].values, dtype=torch.float32)
-            target = torch.tensor(row[self.target_col], dtype=torch.float32)
-            context = {}
-            if self.context_cols:
-                for col in self.context_cols:
-                    if pd.api.types.is_numeric_dtype(self.data[col]):
-                        context[col] = torch.tensor(row[col], dtype=torch.float32)
-                    else:
-                        context[col] = str(row[col])
+        row = self.data.iloc[idx]
+        features = torch.tensor(row[self.feature_cols].values, dtype=torch.float32)
+        target = torch.tensor(row[self.target_col], dtype=torch.float32)
+
+        context = {}
+        if self.context_cols:
+            for col in self.context_cols:
+                if pd.api.types.is_numeric_dtype(row[col]): # Check row data type
+                   context[col] = torch.tensor(row[col], dtype=torch.float32)
+                else:
+                   context[col] = str(row[col])
 
         return {'features': features, 'target': target, 'context': context}
 
 
-def split_data(dataset: TabularDataset, train_ratio: float = 0.8, val_ratio: float = 0.1, test_ratio: float = 0.1,
-               random_seed: int = 42) -> Tuple[Dataset, Dataset, Dataset]:
-    if train_ratio + val_ratio + test_ratio != 1.0:
-        raise ValueError("Train, validation, and test ratios must sum to 1.0")
-
-    dataset_size = len(dataset)
-
-    # --- Method 1: Adjust Split Sizes (Robust for Small Datasets) ---
-    train_size = int(train_ratio * dataset_size)
-    val_size = int(val_ratio * dataset_size)
-    test_size = dataset_size - train_size - val_size
-
-    # Ensure at least one sample in each split
-    if train_size == 0:
-        train_size = 1
-        if test_size > 0:
-            test_size -=1
-        elif val_size > 0:
-            val_size -= 1
-    if val_size == 0:
-        val_size = 1
-        if test_size > 0:
-            test_size -= 1
-        elif train_size > 0:
-            train_size -= 1
-    if test_size == 0:
-        test_size = 1
-        if val_size > 0:
-            val_size -= 1
-        elif train_size > 0:
-            train_size -= 1
-
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size, test_size], generator=torch.Generator().manual_seed(random_seed)
-    )
-    return train_dataset, val_dataset, test_dataset
-
 def create_dataloader(dataset: Dataset, batch_size: int = 32, shuffle: bool = True, num_workers: int = 0) -> DataLoader:
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
-
-
-if __name__ == '__main__':
-    # Create a larger dummy CSV file for demonstration
-    data = {
-        'sensor1': [1.0, 2.0, 3.0, 4.0, 5.0, "6", 7.0, 8.0, 9.0, 10.0] * 5,  # Introduce string
-        'sensor2': [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0] * 5,
-        'category': ['A', 'B', 'A', 'C', 'B', 'A', 'C', 'A', 'B', 'C'] * 5,
-        'time': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] * 5,
-        'target': [10.0, 12.0, 11.0, 13.0, 12.5, 11.5, 14.0, 13.5, 12.8, 11.2] * 5
-    }
-    df = pd.DataFrame(data)
-    df.to_csv('dummy_data.csv', index=False)
-    
-    feature_cols = ['sensor1', 'sensor2', 'category']
-    target_col = 'target'
-    context_cols = ['time']
-    numerical_features_info = {'sensor1': 'standard', 'sensor2': 'minmax'}
-    categorical_features = ['category']
-
-    dataset = TabularDataset(
-        data_path='dummy_data.csv',
-        feature_cols=feature_cols,
-        target_col=target_col,
-        context_cols=context_cols,
-        numerical_features_info=numerical_features_info,
-        categorical_features=categorical_features
-    )
-    
-    train_dataset, val_dataset, test_dataset = split_data(dataset)
-    train_loader = create_dataloader(train_dataset, batch_size=8)
-    val_loader = create_dataloader(val_dataset)
-    test_loader = create_dataloader(test_dataset)
-    
-    for batch in train_loader:
-        features = batch['features']
-        targets = batch['target']
-        context = batch['context']
-        print("Features:", features.dtype)
-        print("Context:", context)
-        print("Targets:", targets)
-        break
-    print(dataset.data.dtypes)

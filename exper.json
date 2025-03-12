@@ -1,10 +1,10 @@
 {
   "feature_dim": 1,
-  "context_dim": 24,
+  "context_dim": 32,
   "embedding_dim": 64,
   "num_heads": 4,
   "num_layers": 2,
   "ffn_dim": 128,
-  "dropout": 0.2,
+  "dropout": 0.35,
   "output_dim": 1
 }
