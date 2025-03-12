@@ -15,8 +15,6 @@ def plot_attention_heatmap(single_batch_attention, feature_names, figsize=(10, 8
     plt.title("Transformer Attention Weights")
     plt.tight_layout()  # Adjust layout to prevent labels from overlapping
     plt.show()
-    
-    
 
 def context_analysis(weights, out_feature_idx, figsize=(12, 6)):
     # Separate feature and context weights

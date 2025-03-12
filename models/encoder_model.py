@@ -83,7 +83,7 @@ class SpecialTransformer(nn.Module):
 
         return output
 
-    def get_attention_weights(self, features: torch.Tensor, context_embedding: torch.Tensor) -> List[torch.Tensor]:
+    def get_attention_weights(self, features: torch.Tensor) -> List[torch.Tensor]:
         """
         Gets the attention weights from all transformer encoder layers.
         """
